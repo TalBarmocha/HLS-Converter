@@ -66,6 +66,7 @@ If you prefer to build the application manually:
    ```
 
 3. **Download FFmpeg binaries for all platforms:**  
+   - From the `bin` folder get `ffmpeg` and `ffprobe` files for your platform.
    - Place the `ffmpeg` and `ffprobe` for your platform at the root of the `bin` folder:
      ```
      bin/
