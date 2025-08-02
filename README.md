@@ -66,6 +66,7 @@ If you prefer to build the application manually:
    ```
 
 3. **Download FFmpeg binaries for all platforms:**  
+   - From the [realese page](https://github.com/TalBarmocha/HLS-Converter/releases) download the latest `bin.zip` and extract the `bin` folder.
    - From the `bin` folder get `ffmpeg` and `ffprobe` files for your platform.
    - Place the `ffmpeg` and `ffprobe` for your platform at the root of the `bin` folder:
      ```
