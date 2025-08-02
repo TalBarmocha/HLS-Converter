@@ -76,25 +76,17 @@ If you prefer to build the application manually:
 
 4. **Build standalone apps:**
 
-   - **macOS ARM:**
+   - **macOS:**
      ```bash
-     pyinstaller --onefile --windowed          --icon=icon.icns          --add-binary "bin/ffmpeg:bin"          --add-binary "bin/ffprobe:bin"          --hidden-import=tkinterdnd2          HLSconverter_modified.py
-     ```
-   - **macOS Intel (Rosetta):**
-     ```bash
-     arch -x86_64 python3 -m PyInstaller --onefile --windowed          --icon=icon.icns          --add-binary "bin/ffmpeg:bin"          --add-binary "bin/ffprobe:bin"          --hidden-import=tkinterdnd2          HLSconverter_modified.py
+     pyinstaller --onefile --windowed --icon=icon.icns --add-binary "bin/ffmpeg:bin" --add-binary "bin/ffprobe:bin" --hidden-import=tkinterdnd2 HLSconverter.py
      ```
    - **Windows:**
-     ```powershell
-     pyinstaller --onefile --windowed ^
-         --icon=icon.ico ^
-         --add-binary "bin\\ffmpeg.exe;bin" ^
-         --add-binary "bin\\ffprobe.exe;bin" ^
-         --hidden-import=tkinterdnd2 ^
-         HLSconverter_modified.py
+     ```bash
+     pyinstaller --onefile --windowed --icon=icon.icns --add-binary "bin/ffmpeg:bin" --add-binary "bin/ffprobe:bin" --hidden-import=tkinterdnd2 HLSconverter.py
      ```
      
-   After the build process the portable application should be in the dist folder
+
+After the build process the portable application should be in the `dist` folder
 
 ---
 
