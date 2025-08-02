@@ -26,7 +26,7 @@ It supports:
 
 ### 🔹 macOS
 
-1. [Download the latest release]((https://github.com/TalBarmocha/HLS-Converter/releases)) (`HLSConverter.app.zip`).  
+1. [Download the latest release](https://github.com/TalBarmocha/HLS-Converter/releases) (`HLSConverter.app.zip`).  
 2. Extract the `.zip` and move **`HLSConverter.app`** to your `Applications` folder.  
 3. Install **FFmpeg** (required):  
 
@@ -41,7 +41,7 @@ It supports:
 
 ### 🔹 Windows
 
-1. [Download the latest release]([https://github.com/yourusername/HLS-Converter/releases](https://github.com/TalBarmocha/HLS-Converter/releases)) (`HLSConverter.exe`).  
+1. [Download the latest release](https://github.com/TalBarmocha/HLS-Converter/releases) (`HLSConverter.exe`).  
 2. Install **FFmpeg**:
    - Download the static build from [ffmpeg.org](https://ffmpeg.org/download.html#build-windows).
    - Extract it and add the `bin` folder to your system **PATH**.  
