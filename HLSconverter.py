@@ -1,0 +1,262 @@
+import os
+import subprocess
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from concurrent.futures import ThreadPoolExecutor
+from tkinterdnd2 import TkinterDnD, DND_FILES
+
+selected_videos = []
+processed_duration_total = [0]
+lock = threading.Lock()
+
+MAX_WORKERS = 2  # Number of simultaneous conversions
+controls_enabled = True
+
+def get_video_duration(video_path):
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True
+        )
+        return float(result.stdout.strip())
+    except:
+        return 0
+
+def convert_single_video(video_path, custom_output_dir, crf_value, total_duration_sum, start_time):
+    """Convert a single video to HLS with live progress updates."""
+    duration = get_video_duration(video_path)
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    base_output_dir = custom_output_dir.strip() if custom_output_dir.strip() else os.path.dirname(video_path)
+    output_dir = os.path.join(base_output_dir, video_name)
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "output.m3u8")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ac", "2",
+        "-preset", "fast",
+        "-crf", str(int(crf_value)),
+        "-start_number", "0",
+        "-hls_time", "10",
+        "-hls_list_size", "0",
+        "-f", "hls",
+        output_file,
+        "-progress", "pipe:1",
+        "-nostats"
+    ]
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+    last_reported = 0
+
+    for line in process.stdout:
+        if "out_time_ms=" in line:
+            value = line.strip().split("=")[1]
+            if not value.isdigit():  # Skip 'N/A' or invalid values
+                continue
+            processed_seconds = int(value) / 1_000_000
+            increment = max(0, processed_seconds - last_reported)
+            last_reported = processed_seconds
+
+            with lock:
+                processed_duration_total[0] = min(total_duration_sum, processed_duration_total[0] + increment)
+                overall_percent = (processed_duration_total[0] / total_duration_sum) * 100 if total_duration_sum else 0
+                elapsed = time.time() - start_time
+                speed = processed_duration_total[0] / elapsed if elapsed > 0 else 0
+                remaining = (total_duration_sum - processed_duration_total[0]) / speed if speed > 0 else 0
+                mins, secs = divmod(max(0, int(remaining)), 60)
+
+                progress_bar['value'] = overall_percent
+                progress_label.config(text=f"{overall_percent:.1f}%")
+                total_time_label.config(text=f"Total Estimated Time Left: {mins:02d}:{secs:02d}")
+                root.update_idletasks()
+
+    process.wait()
+    return video_path, process.returncode == 0
+
+def convert_all_videos_parallel(custom_output_dir, crf_value):
+    try:
+        total_duration = sum(get_video_duration(v) for v in selected_videos)
+        processed_duration_total[0] = 0
+        start_time = time.time()
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(convert_single_video, v, custom_output_dir, crf_value, total_duration, start_time)
+                       for v in selected_videos]
+
+            for future in futures:
+                video_path, success = future.result()
+                if not success:
+                    messagebox.showerror("Error", f"Failed: {os.path.basename(video_path)}")
+
+        messagebox.showinfo("Done", "All conversions completed!")
+
+    finally:
+        enable_controls()
+        clear_all_files()
+        progress_bar['value'] = 0
+        progress_label.config(text="0%")
+        total_time_label.config(text="Total Estimated Time Left: 00:00")
+
+def start_conversion():
+    if not selected_videos:
+        messagebox.showerror("Error", "Please select at least one video!")
+        return
+    output_dir = output_entry.get()
+    crf_value = quality_slider.get()
+    disable_controls()
+    threading.Thread(target=convert_all_videos_parallel, args=(output_dir, crf_value), daemon=True).start()
+
+def add_files(files):
+    if not controls_enabled:
+        return
+    added = False
+    for f in files:
+        f = f.strip().replace("\\", "")
+        if f and f not in selected_videos:
+            selected_videos.append(f)
+            added = True
+            add_file_row(f)
+    if added and not output_entry.get() and selected_videos:
+        folder_path = os.path.dirname(selected_videos[0])
+        output_entry.insert(0, folder_path)
+
+def add_file_row(file_path):
+    row = tk.Frame(file_list_frame, bg=file_list_frame.cget("bg"))
+    row.pack(fill="x", pady=2)
+
+    name_label = tk.Label(row, text=os.path.basename(file_path), anchor="w")
+    name_label.pack(side="left", padx=5)
+
+    rm_btn = tk.Button(
+        row, text="❌", command=lambda: remove_file(file_path, row),
+        fg="red", font=("Arial", 11), relief="flat", bd=0,
+        highlightthickness=0, bg=row.cget("bg"), activebackground=row.cget("bg"),
+        cursor="hand2"
+    )
+    rm_btn.pack(side="right", padx=5)
+
+def remove_file(file_path, row):
+    if not controls_enabled:
+        return
+    if file_path in selected_videos:
+        selected_videos.remove(file_path)
+    row.destroy()
+
+def clear_all_files():
+    selected_videos.clear()
+    for widget in file_list_frame.winfo_children():
+        widget.destroy()
+
+def drop(event):
+    if controls_enabled:
+        files = event.data.strip().split()
+        add_files(files)
+
+def browse_files():
+    if not controls_enabled:
+        return
+    files = filedialog.askopenfilenames(
+        filetypes=[("Video Files", "*.mp4 *.avi *.mkv *.mov *.flv *.wmv")]
+    )
+    if files:
+        add_files(files)
+
+def browse_output_folder():
+    if not controls_enabled:
+        return
+    folder = filedialog.askdirectory()
+    if folder:
+        output_entry.delete(0, tk.END)
+        output_entry.insert(0, folder)
+
+# Enable/disable controls
+def disable_controls():
+    global controls_enabled
+    controls_enabled = False
+    browse_btn.config(state="disabled")
+    clear_all_btn.config(state="disabled")
+    browse_output_btn.config(state="disabled")
+    quality_slider.config(state="disabled")
+    convert_btn.config(state="disabled")
+
+def enable_controls():
+    global controls_enabled
+    controls_enabled = True
+    browse_btn.config(state="normal")
+    clear_all_btn.config(state="normal")
+    browse_output_btn.config(state="normal")
+    quality_slider.config(state="normal")
+    convert_btn.config(state="normal")
+
+# GUI Setup
+root = TkinterDnD.Tk()
+root.title("Video to HLS Converter (Parallel Mode)")
+root.geometry("650x740")
+root.resizable(False, False)
+
+frame = tk.Frame(root)
+frame.pack(expand=True, fill="both", pady=10)
+
+label = tk.Label(frame, text="Drag and Drop Video Files Here", pady=10)
+label.pack(pady=5)
+
+drop_area = tk.Label(frame, text="📂 Drop Files Here", relief="solid", width=60, height=6)
+drop_area.pack(pady=10)
+drop_area.drop_target_register(DND_FILES)
+drop_area.dnd_bind('<<Drop>>', drop)
+
+browse_btn = tk.Button(frame, text="Browse Files", command=browse_files, width=15, height=1)
+browse_btn.pack(anchor="center", padx=15, pady=5)
+
+# File list
+file_list_frame = tk.Frame(frame)
+file_list_frame.pack(pady=5, fill="x")
+
+clear_all_btn = tk.Button(frame, text="Clear All", command=clear_all_files, width=10)
+clear_all_btn.pack(pady=5)
+
+output_label = tk.Label(frame, text="Base Output Folder:")
+output_label.pack(pady=5)
+
+output_frame = tk.Frame(frame)
+output_frame.pack(pady=5)
+
+output_entry = tk.Entry(output_frame, width=40)
+output_entry.pack(side="left", padx=5)
+
+browse_output_btn = tk.Button(output_frame, text="Select", command=browse_output_folder, width=8)
+browse_output_btn.pack(side="right", padx=5)
+
+# Quality slider
+quality_label = tk.Label(frame, text="Quality (CRF): 23")
+quality_label.pack(pady=10)
+quality_slider = tk.Scale(frame, from_=18, to=28, orient="horizontal", length=300, tickinterval=2,
+                          command=lambda val: quality_label.config(text=f"Quality (CRF): {val}"))
+quality_slider.set(23)
+quality_slider.pack(pady=5)
+
+quality_hint = tk.Label(frame, text="Lower CRF = Better Quality (18=Best, 28=Low)", fg="gray")
+quality_hint.pack(pady=2)
+
+convert_btn = tk.Button(frame, text="CONVERT ALL (Parallel)", command=start_conversion, width=20, height=2)
+convert_btn.pack(pady=10)
+
+progress_bar = ttk.Progressbar(frame, length=500, mode='determinate')
+progress_bar.pack(pady=5)
+progress_label = tk.Label(frame, text="0%")
+progress_label.pack()
+
+total_time_label = tk.Label(frame, text="Total Estimated Time Left: 00:00", fg="gray")
+total_time_label.pack(pady=2)
+
+root.mainloop()
