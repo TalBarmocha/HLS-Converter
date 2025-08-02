@@ -7,6 +7,28 @@ from tkinter import filedialog, messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
+def generate_thumbnail(output_dir):
+    """Generates a thumbnail.jpg from the first frame of the middle .ts file."""
+    try:
+        ts_files = sorted([f for f in os.listdir(output_dir) if f.endswith(".ts")])
+        if not ts_files:
+            return
+        middle_ts = ts_files[len(ts_files) // 2]
+        ts_path = os.path.join(output_dir, middle_ts)
+        thumbnail_path = os.path.join(output_dir, "thumbnail.jpg")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", ts_path,
+            "-frames:v", "1",
+            thumbnail_path
+        ]
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        print(f"Thumbnail generation failed: {e}")
+
+
 selected_videos = []
 processed_duration_total = [0]
 lock = threading.Lock()
@@ -81,6 +103,10 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
                 root.update_idletasks()
 
     process.wait()
+
+    # Generate thumbnail after successful conversion
+    if process.returncode == 0:
+        generate_thumbnail(output_dir)
     return video_path, process.returncode == 0
 
 def convert_all_videos_parallel(custom_output_dir, crf_value):
