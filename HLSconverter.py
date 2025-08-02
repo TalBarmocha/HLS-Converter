@@ -1,4 +1,17 @@
+import sys
 import os
+
+# Detect the correct base folder (works for PyInstaller and normal Python)
+BASE_DIR = getattr(sys, '_MEIPASS', os.path.abspath("."))
+
+# Detect platform-specific binary names
+if sys.platform.startswith("win"):
+    FFMPEG_BIN = os.path.join(BASE_DIR, "bin", "ffmpeg.exe")
+    FFPROBE_BIN = os.path.join(BASE_DIR, "bin", "ffprobe.exe")
+else:
+    FFMPEG_BIN = os.path.join(BASE_DIR, "bin", "ffmpeg")
+    FFPROBE_BIN = os.path.join(BASE_DIR, "bin", "ffprobe")
+
 import subprocess
 import threading
 import time
@@ -18,7 +31,7 @@ def generate_thumbnail(output_dir):
         thumbnail_path = os.path.join(output_dir, "thumbnail.jpg")
 
         cmd = [
-            "ffmpeg",
+            FFMPEG_BIN,
             "-y",
             "-i", ts_path,
             "-frames:v", "1",
@@ -39,7 +52,7 @@ controls_enabled = True
 def get_video_duration(video_path):
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -59,7 +72,7 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
     output_file = os.path.join(output_dir, "output.m3u8")
 
     cmd = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-i", video_path,
         "-c:v", "libx264",
