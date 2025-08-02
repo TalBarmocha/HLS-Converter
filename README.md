@@ -66,7 +66,7 @@ If you prefer to build the application manually:
    ```
 
 3. **Download FFmpeg binaries for all platforms:**  
-   - Place the `ffmpeg` and `ffprobe` for your platform in the root of the bin folder:
+   - Place the `ffmpeg` and `ffprobe` for your platform at the root of the `bin` folder:
      ```
      bin/
       ├─ ffmpeg (or .exe on Windows)
@@ -74,40 +74,27 @@ If you prefer to build the application manually:
      ```
    Each folder bin should contain both `ffmpeg` and `ffprobe` (or `.exe` on Windows).
 
-4. **Run the app:**
-
-   ```bash
-   python HLSconverter_modified.py
-   ```
-
-5. **Build standalone apps:**
+4. **Build standalone apps:**
 
    - **macOS ARM:**
      ```bash
-     cp bin/macos_arm/* bin/
      pyinstaller --onefile --windowed          --icon=icon.icns          --add-binary "bin/ffmpeg:bin"          --add-binary "bin/ffprobe:bin"          --hidden-import=tkinterdnd2          HLSconverter_modified.py
-     mv dist/HLSconverter.app dist/HLSconverter-ARM.app
-     rm bin/ffmpeg bin/ffprobe
      ```
    - **macOS Intel (Rosetta):**
      ```bash
-     cp bin/macos_intel/* bin/
      arch -x86_64 python3 -m PyInstaller --onefile --windowed          --icon=icon.icns          --add-binary "bin/ffmpeg:bin"          --add-binary "bin/ffprobe:bin"          --hidden-import=tkinterdnd2          HLSconverter_modified.py
-     mv dist/HLSconverter.app dist/HLSconverter-Intel.app
-     rm bin/ffmpeg bin/ffprobe
      ```
    - **Windows:**
      ```powershell
-     copy bin\windows\* bin\
      pyinstaller --onefile --windowed ^
          --icon=icon.ico ^
          --add-binary "bin\\ffmpeg.exe;bin" ^
          --add-binary "bin\\ffprobe.exe;bin" ^
          --hidden-import=tkinterdnd2 ^
          HLSconverter_modified.py
-     rename dist\HLSconverter.exe HLSconverter-Windows.exe
-     del bin\ffmpeg.exe bin\ffprobe.exe
      ```
+     
+   After the build process the portable application should be in the dist folder
 
 ---
 
