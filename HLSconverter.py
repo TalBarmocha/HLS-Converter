@@ -1,5 +1,12 @@
 import sys
 import os
+import subprocess
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from concurrent.futures import ThreadPoolExecutor
+from tkinterdnd2 import TkinterDnD, DND_FILES
 
 # Detect the correct base folder (works for PyInstaller and normal Python)
 BASE_DIR = getattr(sys, '_MEIPASS', os.path.abspath("."))
@@ -11,14 +18,6 @@ if sys.platform.startswith("win"):
 else:
     FFMPEG_BIN = os.path.join(BASE_DIR, "bin", "ffmpeg")
     FFPROBE_BIN = os.path.join(BASE_DIR, "bin", "ffprobe")
-
-import subprocess
-import threading
-import time
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from concurrent.futures import ThreadPoolExecutor
-from tkinterdnd2 import TkinterDnD, DND_FILES
 
 def generate_thumbnail(output_dir):
     """Generates a thumbnail.jpg from the first frame of the middle .ts file."""
