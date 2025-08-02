@@ -7,7 +7,7 @@ It supports:
 - Batch parallel conversions  
 - CRF quality control  
 - Automatic folder output  
-- Real-time progress and estimated time remaining  
+- Real-time progress and estimated time remaining
 
 ---
 
@@ -18,7 +18,8 @@ It supports:
 - ✅ Drag & drop or browse file selection.  
 - ✅ Adjustable video quality (CRF slider).  
 - ✅ Standalone `.app` (Mac) or `.exe` (Windows) – no Python needed.  
-- ✅ Custom application icon.  
+- ✅ Custom application icon.
+- ✅ Generates thumbnail photo.
 
 ---
 
