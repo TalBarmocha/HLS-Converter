@@ -9,12 +9,14 @@ It supports:
 - Automatic folder output  
 - Real-time progress and estimated time remaining  
 - Built-in FFmpeg binaries (no manual install required)
+- Converts videos to **HLS with H.264 video codec and AAC audio codec** for maximum compatibility.
 
 ---
 
 ## 🚀 Features
 
-- ✅ Convert `.mp4`, `.mkv`, `.avi`, `.mov`, `.wmv`, `.flv` to HLS (`.m3u8`).  
+- ✅ Convert `.mp4`, `.mkv`, `.avi`, `.mov`, `.wmv`, `.flv` to HLS (`.m3u8`).
+- ✅ Encodes output to **H.264 (video)** and **AAC (audio)** formats. 
 - ✅ Parallel batch processing (2 files simultaneously).  
 - ✅ Drag & drop or browse file selection.  
 - ✅ Adjustable video quality (CRF slider).  
