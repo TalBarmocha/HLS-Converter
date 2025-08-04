@@ -19,27 +19,99 @@ else:
     FFMPEG_BIN = os.path.join(BASE_DIR, "bin", "ffmpeg")
     FFPROBE_BIN = os.path.join(BASE_DIR, "bin", "ffprobe")
 
-def generate_thumbnail(output_dir):
-    """Generates a thumbnail.jpg from the first frame of the middle .ts file."""
-    try:
-        ts_files = sorted([f for f in os.listdir(output_dir) if f.endswith(".ts")])
-        if not ts_files:
-            return
-        middle_ts = ts_files[len(ts_files) // 2]
-        ts_path = os.path.join(output_dir, middle_ts)
-        thumbnail_path = os.path.join(output_dir, "thumbnail.jpg")
 
+def generate_thumbnail(input_path, output_dir):
+    """Generate a thumbnail image from the video at 25% of its duration."""
+    try:
+        duration = get_video_duration(input_path)
+        if duration == 0:
+            raise ValueError("Could not determine video duration")
+
+        # Pick a frame at 25% of the video duration
+        quarter_time = duration * 0.25
+        seek_str = time.strftime("%H:%M:%S", time.gmtime(quarter_time))
+
+        thumbnail_path = os.path.join(output_dir, "thumbnail.jpg")
         cmd = [
             FFMPEG_BIN,
             "-y",
-            "-i", ts_path,
+            "-ss", seek_str,         # Seek BEFORE input for fast seeking
+            "-i", input_path,
             "-frames:v", "1",
             thumbnail_path
         ]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception as e:
-        print(f"Thumbnail generation failed: {e}")
+        print(f"Thumbnail generation failed for {input_path}: {e}")
 
+def detect_gpu_encoder():
+    """Detect the best available GPU encoder for H.264."""
+    try:
+        result = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        encoders = result.stdout.lower()
+
+        if sys.platform.startswith("darwin"):
+            if "h264_videotoolbox" in encoders:
+                return "h264_videotoolbox"
+        elif sys.platform.startswith("win"):
+            if "h264_nvenc" in encoders:
+                return "h264_nvenc"
+            elif "h264_qsv" in encoders:
+                return "h264_qsv"
+            elif "h264_amf" in encoders:
+                return "h264_amf"
+
+        return "libx264"
+    except Exception as e:
+        print(f"GPU detection failed: {e}")
+        return "libx264"
+
+def gpu_type_to_string():
+    """Convert GPU encoder type to a human-readable string."""
+    gpu = detect_gpu_encoder()
+    if gpu == "h264_videotoolbox":
+        return "Apple VideoToolbox"
+    elif gpu == "h264_nvenc":
+        return "NVIDIA NVENC"
+    elif gpu == "h264_qsv":
+        return "Intel Quick Sync"
+    elif gpu == "h264_amf":
+        return "AMD AMF"
+    elif gpu == "libx264":
+        return "Software (libx264)"
+    else:
+        return "Unknown GPU Encoder"
+
+def get_codecs(video_path):
+    """Get the video and audio codecs of the input video file."""
+    try:
+        result = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        video_codec = result.stdout.strip().lower()
+
+        result = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "a:0", "-show_entries",
+             "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        audio_codec = result.stdout.strip().lower()
+
+        return video_codec, audio_codec
+    except Exception as e:
+        print(f"Failed to get codecs for {video_path}: {e}")
+        return None, None
 
 selected_videos = []
 processed_duration_total = [0]
@@ -47,8 +119,10 @@ lock = threading.Lock()
 
 MAX_WORKERS = 2  # Number of simultaneous conversions
 controls_enabled = True
+encoder = detect_gpu_encoder()
 
 def get_video_duration(video_path):
+    """Get the duration of the video file."""
     try:
         result = subprocess.run(
             [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
@@ -69,25 +143,53 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
     output_dir = os.path.join(base_output_dir, video_name)
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, "output.m3u8")
+    video_codec, audio_codec = get_codecs(video_path)
+    generate_thumbnail(video_path, output_dir)
 
-    cmd = [
-        FFMPEG_BIN,
-        "-y",
-        "-i", video_path,
-        "-c:v", "libx264",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ac", "2",
-        "-preset", "fast",
-        "-crf", str(int(crf_value)),
-        "-start_number", "0",
-        "-hls_time", "10",
-        "-hls_list_size", "0",
-        "-f", "hls",
-        output_file,
-        "-progress", "pipe:1",
-        "-nostats"
-    ]
+    use_remux = "h264" in video_codec and "aac" in audio_codec
+
+    if use_remux:
+        cmd = [
+            FFMPEG_BIN,
+            "-y",
+            "-i", video_path,
+            "-c", "copy",
+            "-start_number", "0",
+            "-hls_time", "10",
+            "-hls_list_size", "0",
+            "-f", "hls",
+            output_file,
+            "-progress", "pipe:1",
+            "-nostats"
+        ]
+    else:
+        cmd = [
+            FFMPEG_BIN,
+            "-y",
+            "-i", video_path,
+            "-c:v", encoder,
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ac", "2",
+            "-start_number", "0",
+            "-hls_time", "10",
+            "-hls_list_size", "0",
+            "-f", "hls",
+            output_file,
+            "-progress", "pipe:1",
+            "-nostats"
+        ]
+
+        # Add optional parameters only if using CPU
+        if encoder == "libx264":
+            cmd.insert(cmd.index("-c:v") + 2, "-preset")
+            cmd.insert(cmd.index("-preset") + 1, "fast")
+            cmd.insert(cmd.index("-preset") + 2, "-crf")
+            cmd.insert(cmd.index("-crf") + 1, str(int(crf_value)))
+        else:
+            cmd.insert(cmd.index("-c:v") + 2, "-b:v")
+            cmd.insert(cmd.index("-b:v") + 1, "5000k")
+
 
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
     last_reported = 0
@@ -115,13 +217,10 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
                 root.update_idletasks()
 
     process.wait()
-
-    # Generate thumbnail after successful conversion
-    if process.returncode == 0:
-        generate_thumbnail(output_dir)
     return video_path, process.returncode == 0
 
 def convert_all_videos_parallel(custom_output_dir, crf_value):
+    """Convert all selected videos in parallel with progress updates."""
     try:
         total_duration = sum(get_video_duration(v) for v in selected_videos)
         processed_duration_total[0] = 0
@@ -146,6 +245,7 @@ def convert_all_videos_parallel(custom_output_dir, crf_value):
         total_time_label.config(text="Total Estimated Time Left: 00:00")
 
 def start_conversion():
+    """Start the conversion process for all selected videos."""
     if not selected_videos:
         messagebox.showerror("Error", "Please select at least one video!")
         return
@@ -155,6 +255,7 @@ def start_conversion():
     threading.Thread(target=convert_all_videos_parallel, args=(output_dir, crf_value), daemon=True).start()
 
 def add_files(files):
+    """Add files to the list of selected videos."""
     if not controls_enabled:
         return
     added = False
@@ -169,6 +270,7 @@ def add_files(files):
         output_entry.insert(0, folder_path)
 
 def add_file_row(file_path):
+    """Add a row to the file list frame for the given file path."""
     row = tk.Frame(file_list_frame, bg=file_list_frame.cget("bg"))
     row.pack(fill="x", pady=2)
 
@@ -184,6 +286,7 @@ def add_file_row(file_path):
     rm_btn.pack(side="right", padx=5)
 
 def remove_file(file_path, row):
+    """Remove a file from the list of selected videos."""
     if not controls_enabled:
         return
     if file_path in selected_videos:
@@ -191,16 +294,19 @@ def remove_file(file_path, row):
     row.destroy()
 
 def clear_all_files():
+    """Clear all selected files and the file list frame."""
     selected_videos.clear()
     for widget in file_list_frame.winfo_children():
         widget.destroy()
 
 def drop(event):
+    """Handle file drop events."""
     if controls_enabled:
-        files = event.data.strip().split()
+        files = root.tk.splitlist(event.data)
         add_files(files)
 
 def browse_files():
+    """Open a file dialog to select video files."""
     if not controls_enabled:
         return
     files = filedialog.askopenfilenames(
@@ -210,6 +316,7 @@ def browse_files():
         add_files(files)
 
 def browse_output_folder():
+    """Open a folder dialog to select the output folder."""
     if not controls_enabled:
         return
     folder = filedialog.askdirectory()
@@ -219,6 +326,7 @@ def browse_output_folder():
 
 # Enable/disable controls
 def disable_controls():
+    """Disable all controls to prevent user interaction during conversion."""
     global controls_enabled
     controls_enabled = False
     browse_btn.config(state="disabled")
@@ -228,6 +336,7 @@ def disable_controls():
     convert_btn.config(state="disabled")
 
 def enable_controls():
+    """Enable all controls after conversion is done."""
     global controls_enabled
     controls_enabled = True
     browse_btn.config(state="normal")
@@ -238,7 +347,7 @@ def enable_controls():
 
 # GUI Setup
 root = TkinterDnD.Tk()
-root.title("Video to HLS Converter (Parallel Mode)")
+root.title("Video to HLS Converter")
 root.geometry("650x740")
 root.resizable(False, False)
 
@@ -276,17 +385,20 @@ browse_output_btn = tk.Button(output_frame, text="Select", command=browse_output
 browse_output_btn.pack(side="right", padx=5)
 
 # Quality slider
-quality_label = tk.Label(frame, text="Quality (CRF): 23")
+quality_label = tk.Label(frame, text="Quality (CRF): 18")
 quality_label.pack(pady=10)
 quality_slider = tk.Scale(frame, from_=18, to=28, orient="horizontal", length=300, tickinterval=2,
                           command=lambda val: quality_label.config(text=f"Quality (CRF): {val}"))
-quality_slider.set(23)
+quality_slider.set(18)
 quality_slider.pack(pady=5)
 
 quality_hint = tk.Label(frame, text="Lower CRF = Better Quality (18=Best, 28=Low)", fg="gray")
 quality_hint.pack(pady=2)
 
-convert_btn = tk.Button(frame, text="CONVERT ALL (Parallel)", command=start_conversion, width=20, height=2)
+gpu_type_label = tk.Label(frame, text="GPU Encoder Detected: " + gpu_type_to_string())
+gpu_type_label.pack(pady=5)
+
+convert_btn = tk.Button(frame, text="CONVERT ALL", command=start_conversion, width=20, height=2)
 convert_btn.pack(pady=10)
 
 progress_bar = ttk.Progressbar(frame, length=500, mode='determinate')
