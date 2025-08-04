@@ -10,19 +10,22 @@ It supports:
 - Real-time progress and estimated time remaining  
 - Built-in FFmpeg binaries (no manual install required)
 - Converts videos to **HLS with H.264 video codec and AAC audio codec** for maximum compatibility.
+- Detect if remuxing can be used instead of re-encoding.
 
 ---
 
 ## 🚀 Features
 
 - ✅ Convert `.mp4`, `.mkv`, `.avi`, `.mov`, `.wmv`, `.flv` to HLS (`.m3u8`).
-- ✅ Encodes output to **H.264 (video)** and **AAC (audio)** formats. 
+- ✅ Encodes output to **H.264 (video)** and **AAC (audio)** formats.
+- ✅ GPU-accelerated encoding capability.
 - ✅ Parallel batch processing (2 files simultaneously).  
 - ✅ Drag & drop or browse file selection.  
 - ✅ Adjustable video quality (CRF slider).  
 - ✅ Standalone `.app` (Mac Intel & Apple Silicon) or `.exe` (Windows) – **no Python or FFmpeg installation needed**.  
 - ✅ Custom application icon.  
-- ✅ Automatic thumbnail generation from the middle frame.
+- ✅ Generates a thumbnail automatically at 25% of the video’s duration.
+
 
 ---
 
