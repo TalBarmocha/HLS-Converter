@@ -310,7 +310,7 @@ def browse_files():
     if not controls_enabled:
         return
     files = filedialog.askopenfilenames(
-        filetypes=[("Video Files", "*.mp4 *.avi *.mkv *.mov *.flv *.wmv")]
+        filetypes=[("Video Files", "*.mp4 *.m4v *.avi *.mkv *.mov *.flv *.wmv")]
     )
     if files:
         add_files(files)
@@ -345,11 +345,51 @@ def enable_controls():
     quality_slider.config(state="normal")
     convert_btn.config(state="normal")
 
+class ScrollableFrame(tk.Frame):
+    def __init__(self, parent, height=220, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+        self.canvas = tk.Canvas(self, highlightthickness=0, height=height)
+        self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = tk.Frame(self.canvas)
+
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")
+        ))
+        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.vscroll.set)
+
+        # Layout
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vscroll.pack(side="right", fill="y")
+
+        # Mouse wheel support (Windows/macOS/Linux)
+        self._bind_mousewheel(self.canvas)
+
+    def _bind_mousewheel(self, widget):
+        # Windows and Linux
+        widget.bind("<Enter>", lambda e: widget.bind_all("<MouseWheel>", self._on_mousewheel))
+        widget.bind("<Leave>", lambda e: widget.unbind_all("<MouseWheel>"))
+        # macOS (uses <Button-4/5> or <MouseWheel> with different delta on some Tk builds)
+        widget.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
+        widget.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+
+    def _on_mousewheel(self, event):
+        # On Windows event.delta is multiples of 120; on Linux often ±1
+        delta = -1 if event.delta > 0 else 1
+        if abs(event.delta) >= 120:
+            delta = -int(event.delta / 120)  # normalize Windows steps
+        self.canvas.yview_scroll(delta, "units")
+
+    @property
+    def content(self):
+        return self.inner
+
+
 # GUI Setup
 root = TkinterDnD.Tk()
 root.title("Video to HLS Converter")
-root.geometry("650x740")
-root.resizable(False, False)
+root.geometry("650x800")
+root.resizable(True, True)
 
 frame = tk.Frame(root)
 frame.pack(expand=True, fill="both", pady=10)
@@ -366,8 +406,12 @@ browse_btn = tk.Button(frame, text="Browse Files", command=browse_files, width=1
 browse_btn.pack(anchor="center", padx=15, pady=5)
 
 # File list
-file_list_frame = tk.Frame(frame)
-file_list_frame.pack(pady=5, fill="x")
+# --- File list (scrollable) ---
+file_list_container = ScrollableFrame(frame, height=150)  # adjust height as you like
+file_list_container.pack(pady=5, fill="both", expand=False)
+
+# Use this as the parent for file rows:
+file_list_frame = file_list_container.content
 
 clear_all_btn = tk.Button(frame, text="Clear All", command=clear_all_files, width=10)
 clear_all_btn.pack(pady=5)
@@ -385,14 +429,14 @@ browse_output_btn = tk.Button(output_frame, text="Select", command=browse_output
 browse_output_btn.pack(side="right", padx=5)
 
 # Quality slider
-quality_label = tk.Label(frame, text="Quality (CRF): 18")
+quality_label = tk.Label(frame, text="Quality (CRF): 16")
 quality_label.pack(pady=10)
-quality_slider = tk.Scale(frame, from_=18, to=28, orient="horizontal", length=300, tickinterval=2,
+quality_slider = tk.Scale(frame, from_=16, to=28, orient="horizontal", length=300, tickinterval=2,
                           command=lambda val: quality_label.config(text=f"Quality (CRF): {val}"))
-quality_slider.set(18)
+quality_slider.set(16)
 quality_slider.pack(pady=5)
 
-quality_hint = tk.Label(frame, text="Lower CRF = Better Quality (18=Best, 28=Low)", fg="gray")
+quality_hint = tk.Label(frame, text="Lower CRF = Better Quality (16=Best, 28=Low)", fg="gray")
 quality_hint.pack(pady=2)
 
 gpu_type_label = tk.Label(frame, text="GPU Encoder Detected: " + gpu_type_to_string())
