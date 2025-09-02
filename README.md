@@ -16,7 +16,7 @@ It supports:
 
 ## 🚀 Features
 
-- ✅ Convert `.mp4`, `.mkv`, `.avi`, `.mov`, `.wmv`, `.flv` to HLS (`.m3u8`).
+- ✅ Convert `.mp4`,`.m4v`, `.mkv`, `.avi`, `.mov`, `.wmv`, `.flv` to HLS (`.m3u8`).
 - ✅ Encodes output to **H.264 (video)** and **AAC (audio)** formats.
 - ✅ GPU-accelerated encoding capability.
 - ✅ Parallel batch processing (2 files simultaneously).  
