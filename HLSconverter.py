@@ -19,15 +19,55 @@ else:
     FFMPEG_BIN = os.path.join(BASE_DIR, "bin", "ffmpeg")
     FFPROBE_BIN = os.path.join(BASE_DIR, "bin", "ffprobe")
 
+# -----------------------------
+# Helpers & preflight checks
+# -----------------------------
+
+def verify_binaries():
+    """Ensure ffmpeg/ffprobe exist and are executable; otherwise exit gracefully."""
+    missing = []
+    for b in (FFMPEG_BIN, FFPROBE_BIN):
+        if not os.path.isfile(b):
+            missing.append(b)
+        elif not os.access(b, os.X_OK):
+            try:
+                os.chmod(b, 0o755)
+            except Exception:
+                missing.append(b)
+    if missing:
+        messagebox.showerror(
+            "Missing Binaries",
+            "Required ffmpeg/ffprobe not found or not executable:\n" + "\n".join(missing)
+        )
+        root.destroy()
+
+
+def _clean_path(p: str) -> str:
+    """Normalize incoming paths (especially from TkinterDnD) without stripping backslashes."""
+    if not isinstance(p, str):
+        return ""
+    p = p.strip()
+    # TkinterDnD may wrap paths with braces or quotes if they contain spaces
+    if (p.startswith("{") and p.endswith("}")) or (p.startswith('"') and p.endswith('"')):
+        p = p[1:-1]
+    return os.path.normpath(p)
+
+
+# Thread-safe UI updater (call from worker threads)
+# Will be bound after `root` is created
+ui_async = None
+
+
+# -----------------------------
+# FFmpeg utilities
+# -----------------------------
 
 def generate_thumbnail(input_path, output_dir):
     """Generate a thumbnail image from the video at 25% of its duration."""
     try:
         duration = get_video_duration(input_path)
-        if duration == 0:
-            raise ValueError("Could not determine video duration")
-
-        # Pick a frame at 25% of the video duration
+        if duration <= 0:
+            return  # skip silently
         quarter_time = duration * 0.25
         seek_str = time.strftime("%H:%M:%S", time.gmtime(quarter_time))
 
@@ -44,6 +84,7 @@ def generate_thumbnail(input_path, output_dir):
     except Exception as e:
         print(f"Thumbnail generation failed for {input_path}: {e}")
 
+
 def detect_gpu_encoder():
     """Detect the best available GPU encoder for H.264."""
     try:
@@ -53,7 +94,9 @@ def detect_gpu_encoder():
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        encoders = result.stdout.lower()
+        if result.returncode != 0:
+            return "libx264"
+        encoders = (result.stdout or "").lower()
 
         if sys.platform.startswith("darwin"):
             if "h264_videotoolbox" in encoders:
@@ -71,6 +114,7 @@ def detect_gpu_encoder():
         print(f"GPU detection failed: {e}")
         return "libx264"
 
+
 def gpu_type_to_string():
     """Convert GPU encoder type to a human-readable string."""
     gpu = detect_gpu_encoder()
@@ -87,6 +131,7 @@ def gpu_type_to_string():
     else:
         return "Unknown GPU Encoder"
 
+
 def get_codecs(video_path):
     """Get the video and audio codecs of the input video file."""
     try:
@@ -97,7 +142,7 @@ def get_codecs(video_path):
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        video_codec = result.stdout.strip().lower()
+        video_codec = (result.stdout or "").strip().lower()
 
         result = subprocess.run(
             [FFPROBE_BIN, "-v", "error", "-select_streams", "a:0", "-show_entries",
@@ -106,23 +151,16 @@ def get_codecs(video_path):
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        audio_codec = result.stdout.strip().lower()
+        audio_codec = (result.stdout or "").strip().lower()
 
-        return video_codec, audio_codec
+        return video_codec or None, audio_codec or None
     except Exception as e:
         print(f"Failed to get codecs for {video_path}: {e}")
         return None, None
 
-selected_videos = []
-processed_duration_total = [0]
-lock = threading.Lock()
-
-MAX_WORKERS = 2  # Number of simultaneous conversions
-controls_enabled = True
-encoder = detect_gpu_encoder()
 
 def get_video_duration(video_path):
-    """Get the duration of the video file."""
+    """Get the duration of the video file in seconds (float). Returns 0 on failure."""
     try:
         result = subprocess.run(
             [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
@@ -131,22 +169,50 @@ def get_video_duration(video_path):
             stderr=subprocess.STDOUT,
             universal_newlines=True
         )
-        return float(result.stdout.strip())
-    except:
+        return float((result.stdout or "0").strip())
+    except Exception:
         return 0
+
+
+# -----------------------------
+# Global state
+# -----------------------------
+selected_videos = []
+processed_duration_total = [0]
+lock = threading.Lock()
+
+MAX_WORKERS = 2  # Number of simultaneous conversions
+controls_enabled = True
+encoder = detect_gpu_encoder()
+
+
+# -----------------------------
+# Conversion workers (run in threads)
+# -----------------------------
 
 def convert_single_video(video_path, custom_output_dir, crf_value, total_duration_sum, start_time):
     """Convert a single video to HLS with live progress updates."""
     duration = get_video_duration(video_path)
+    if duration <= 0:
+        return video_path, False
+
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     base_output_dir = custom_output_dir.strip() if custom_output_dir.strip() else os.path.dirname(video_path)
     output_dir = os.path.join(base_output_dir, video_name)
-    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as e:
+        print(f"Failed to create output dir {output_dir}: {e}")
+        return video_path, False
+
     output_file = os.path.join(output_dir, "output.m3u8")
     video_codec, audio_codec = get_codecs(video_path)
     generate_thumbnail(video_path, output_dir)
 
-    use_remux = "h264" in video_codec and "aac" in audio_codec
+    v = (video_codec or "").lower()
+    a = (audio_codec or "").lower()
+    use_remux = v.startswith("h264") and a == "aac"
 
     if use_remux:
         cmd = [
@@ -179,7 +245,6 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
             "-progress", "pipe:1",
             "-nostats"
         ]
-
         # Add optional parameters only if using CPU
         if encoder == "libx264":
             cmd.insert(cmd.index("-c:v") + 2, "-preset")
@@ -189,7 +254,6 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
         else:
             cmd.insert(cmd.index("-c:v") + 2, "-b:v")
             cmd.insert(cmd.index("-b:v") + 1, "5000k")
-
 
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
     last_reported = 0
@@ -211,13 +275,14 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
                 remaining = (total_duration_sum - processed_duration_total[0]) / speed if speed > 0 else 0
                 mins, secs = divmod(max(0, int(remaining)), 60)
 
-                progress_bar['value'] = overall_percent
-                progress_label.config(text=f"{overall_percent:.1f}%")
-                total_time_label.config(text=f"Total Estimated Time Left: {mins:02d}:{secs:02d}")
-                root.update_idletasks()
+                # Update UI from main thread
+                ui_async(progress_bar.configure, value=overall_percent)
+                ui_async(progress_label.config, text=f"{overall_percent:.1f}%")
+                ui_async(total_time_label.config, text=f"Total Estimated Time Left: {mins:02d}:{secs:02d}")
 
     process.wait()
     return video_path, process.returncode == 0
+
 
 def convert_all_videos_parallel(custom_output_dir, crf_value):
     """Convert all selected videos in parallel with progress updates."""
@@ -233,41 +298,62 @@ def convert_all_videos_parallel(custom_output_dir, crf_value):
             for future in futures:
                 video_path, success = future.result()
                 if not success:
-                    messagebox.showerror("Error", f"Failed: {os.path.basename(video_path)}")
+                    ui_async(messagebox.showerror, "Error", f"Failed: {os.path.basename(video_path)}")
 
-        messagebox.showinfo("Done", "All conversions completed!")
+        ui_async(messagebox.showinfo, "Done", "All conversions completed!")
 
     finally:
-        enable_controls()
-        clear_all_files()
-        progress_bar['value'] = 0
-        progress_label.config(text="0%")
-        total_time_label.config(text="Total Estimated Time Left: 00:00")
+        # Reset UI from main thread
+        ui_async(enable_controls)
+        ui_async(clear_all_files)
+        ui_async(progress_bar.configure, value=0)
+        ui_async(progress_label.config, text="0%")
+        ui_async(total_time_label.config, text="Total Estimated Time Left: 00:00")
+
+
+# -----------------------------
+# UI Actions
+# -----------------------------
 
 def start_conversion():
     """Start the conversion process for all selected videos."""
     if not selected_videos:
         messagebox.showerror("Error", "Please select at least one video!")
         return
-    output_dir = output_entry.get()
+
+    output_dir = output_entry.get().strip()
+    if output_dir:
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            # quick writability probe
+            test_path = os.path.join(output_dir, ".write_test")
+            with open(test_path, "w") as f:
+                f.write("ok")
+            os.remove(test_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Output folder is not writable:\n{output_dir}\n\n{e}")
+            return
+
     crf_value = quality_slider.get()
     disable_controls()
     threading.Thread(target=convert_all_videos_parallel, args=(output_dir, crf_value), daemon=True).start()
 
+
 def add_files(files):
-    """Add files to the list of selected videos."""
+    """Add files to the list of selected videos (robust to Hebrew/Unicode paths)."""
     if not controls_enabled:
         return
     added = False
-    for f in files:
-        f = f.strip().replace("\\", "")
-        if f and f not in selected_videos:
+    for raw in files:
+        f = _clean_path(raw)
+        if f and os.path.isfile(f) and f not in selected_videos:
             selected_videos.append(f)
             added = True
             add_file_row(f)
     if added and not output_entry.get() and selected_videos:
         folder_path = os.path.dirname(selected_videos[0])
         output_entry.insert(0, folder_path)
+
 
 def add_file_row(file_path):
     """Add a row to the file list frame for the given file path."""
@@ -285,6 +371,7 @@ def add_file_row(file_path):
     )
     rm_btn.pack(side="right", padx=5)
 
+
 def remove_file(file_path, row):
     """Remove a file from the list of selected videos."""
     if not controls_enabled:
@@ -293,11 +380,13 @@ def remove_file(file_path, row):
         selected_videos.remove(file_path)
     row.destroy()
 
+
 def clear_all_files():
     """Clear all selected files and the file list frame."""
     selected_videos.clear()
     for widget in file_list_frame.winfo_children():
         widget.destroy()
+
 
 def drop(event):
     """Handle file drop events."""
@@ -305,15 +394,17 @@ def drop(event):
         files = root.tk.splitlist(event.data)
         add_files(files)
 
+
 def browse_files():
     """Open a file dialog to select video files."""
     if not controls_enabled:
         return
     files = filedialog.askopenfilenames(
-        filetypes=[("Video Files", "*.mp4 *.m4v *.avi *.mkv *.mov *.flv *.wmv")]
+        filetypes=[("Video Files", "*.mp4 *.m4v *.avi *.mkv *.mov *.flv *.wmv *.ts *.webm")]
     )
     if files:
         add_files(files)
+
 
 def browse_output_folder():
     """Open a folder dialog to select the output folder."""
@@ -324,7 +415,9 @@ def browse_output_folder():
         output_entry.delete(0, tk.END)
         output_entry.insert(0, folder)
 
+
 # Enable/disable controls
+
 def disable_controls():
     """Disable all controls to prevent user interaction during conversion."""
     global controls_enabled
@@ -335,6 +428,7 @@ def disable_controls():
     quality_slider.config(state="disabled")
     convert_btn.config(state="disabled")
 
+
 def enable_controls():
     """Enable all controls after conversion is done."""
     global controls_enabled
@@ -344,6 +438,7 @@ def enable_controls():
     browse_output_btn.config(state="normal")
     quality_slider.config(state="normal")
     convert_btn.config(state="normal")
+
 
 class ScrollableFrame(tk.Frame):
     def __init__(self, parent, height=220, *args, **kwargs):
@@ -366,12 +461,12 @@ class ScrollableFrame(tk.Frame):
         self._bind_mousewheel(self.canvas)
 
     def _bind_mousewheel(self, widget):
-        # Windows and Linux
-        widget.bind("<Enter>", lambda e: widget.bind_all("<MouseWheel>", self._on_mousewheel))
-        widget.bind("<Leave>", lambda e: widget.unbind_all("<MouseWheel>"))
-        # macOS (uses <Button-4/5> or <MouseWheel> with different delta on some Tk builds)
-        widget.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        widget.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+        # Bind only when pointer is over the widget; unbind on leave
+        widget.bind("<Enter>", lambda e: widget.bind("<MouseWheel>", self._on_mousewheel))
+        widget.bind("<Leave>", lambda e: widget.unbind("<MouseWheel>"))
+        # Some X11 builds use Button-4/5
+        widget.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
+        widget.bind("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
 
     def _on_mousewheel(self, event):
         # On Windows event.delta is multiples of 120; on Linux often ±1
@@ -385,11 +480,19 @@ class ScrollableFrame(tk.Frame):
         return self.inner
 
 
+# -----------------------------
 # GUI Setup
+# -----------------------------
 root = TkinterDnD.Tk()
 root.title("Video to HLS Converter")
 root.geometry("650x800")
 root.resizable(True, True)
+
+# Bind the UI async dispatcher now that root exists
+ui_async = lambda fn, *args, **kwargs: root.after(0, lambda: fn(*args, **kwargs))
+
+# (Optional) verify ffmpeg/ffprobe existence immediately
+verify_binaries()
 
 frame = tk.Frame(root)
 frame.pack(expand=True, fill="both", pady=10)
@@ -405,12 +508,9 @@ drop_area.dnd_bind('<<Drop>>', drop)
 browse_btn = tk.Button(frame, text="Browse Files", command=browse_files, width=15, height=1)
 browse_btn.pack(anchor="center", padx=15, pady=5)
 
-# File list
-# --- File list (scrollable) ---
-file_list_container = ScrollableFrame(frame, height=150)  # adjust height as you like
+# File list (scrollable)
+file_list_container = ScrollableFrame(frame, height=150)
 file_list_container.pack(pady=5, fill="both", expand=False)
-
-# Use this as the parent for file rows:
 file_list_frame = file_list_container.content
 
 clear_all_btn = tk.Button(frame, text="Clear All", command=clear_all_files, width=10)
