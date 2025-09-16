@@ -101,7 +101,7 @@ def _test_h264_encoder(encoder_name: str) -> bool:
         cmd = [
             FFMPEG_BIN,
             "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=30",
+            "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30",
             "-t", "1",                     # ~1 second
             "-pix_fmt", "yuv420p",         # safe for h264
             "-c:v", encoder_name,
