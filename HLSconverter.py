@@ -3,10 +3,15 @@ import os
 import subprocess
 import threading
 import time
+import signal
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor
 from tkinterdnd2 import TkinterDnD, DND_FILES
+
+# Track all running ffmpeg processes so we can stop them on close
+RUNNING_PROCS = set()
+SHUTTING_DOWN = False
 
 # Detect the correct base folder (works for PyInstaller and normal Python)
 BASE_DIR = getattr(sys, '_MEIPASS', os.path.abspath("."))
@@ -85,34 +90,73 @@ def generate_thumbnail(input_path, output_dir):
         print(f"Thumbnail generation failed for {input_path}: {e}")
 
 
-def detect_gpu_encoder():
-    """Detect the best available GPU encoder for H.264."""
+def _test_h264_encoder(encoder_name: str) -> bool:
+    """
+    Try a tiny hardware-encode to verify the encoder actually works.
+    Encodes a few frames from the FFmpeg test source to a null muxer.
+    Returns True if the encoder succeeds, False otherwise.
+    """
     try:
-        result = subprocess.run(
+        # Use null sink; keep it tiny and quiet
+        cmd = [
+            FFMPEG_BIN,
+            "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=30",
+            "-t", "1",                     # ~1 second
+            "-pix_fmt", "yuv420p",         # safe for h264
+            "-c:v", encoder_name,
+            "-f", "null", "-"              # write to stdout (ignored)
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def detect_gpu_encoder():
+    """
+    Detect the best available GPU encoder for H.264 and verify it with a tiny encode test.
+    Falls back to CPU (libx264) if unsupported or the test fails.
+    """
+    # Default fallback
+    fallback = "libx264"
+
+    try:
+        # List available encoders
+        res = subprocess.run(
             [FFMPEG_BIN, "-hide_banner", "-encoders"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
         )
-        if result.returncode != 0:
-            return "libx264"
-        encoders = (result.stdout or "").lower()
+        if res.returncode != 0:
+            return fallback
+        encoders_txt = (res.stdout or "").lower()
 
+        # Candidate order by platform
+        candidates = []
         if sys.platform.startswith("darwin"):
-            if "h264_videotoolbox" in encoders:
-                return "h264_videotoolbox"
+            if "h264_videotoolbox" in encoders_txt:
+                candidates.append("h264_videotoolbox")
         elif sys.platform.startswith("win"):
-            if "h264_nvenc" in encoders:
-                return "h264_nvenc"
-            elif "h264_qsv" in encoders:
-                return "h264_qsv"
-            elif "h264_amf" in encoders:
-                return "h264_amf"
+            # Prefer NVENC, then QSV, then AMF
+            if "h264_nvenc" in encoders_txt:
+                candidates.append("h264_nvenc")
+            if "h264_qsv" in encoders_txt:
+                candidates.append("h264_qsv")
+            if "h264_amf" in encoders_txt:
+                candidates.append("h264_amf")
 
-        return "libx264"
+        # Verify by actually encoding a few frames
+        for enc in candidates:
+            if _test_h264_encoder(enc):
+                return enc
+
+        # Nothing passed—fallback to CPU
+        return fallback
+
     except Exception as e:
         print(f"GPU detection failed: {e}")
-        return "libx264"
+        return fallback
+
 
 
 def gpu_type_to_string():
@@ -181,7 +225,7 @@ selected_videos = []
 processed_duration_total = [0]
 lock = threading.Lock()
 
-MAX_WORKERS = 2  # Number of simultaneous conversions
+MAX_WORKERS = max((os.cpu_count() // 2 ), 2)  # Number of simultaneous conversions
 controls_enabled = True
 encoder = detect_gpu_encoder()
 
@@ -191,7 +235,7 @@ encoder = detect_gpu_encoder()
 # -----------------------------
 
 def convert_single_video(video_path, custom_output_dir, crf_value, total_duration_sum, start_time):
-    """Convert a single video to HLS with live progress updates."""
+    """Convert a single video to HLS with YOUR exact FFmpeg settings and live progress."""
     duration = get_video_duration(video_path)
     if duration <= 0:
         return video_path, False
@@ -206,62 +250,101 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
         print(f"Failed to create output dir {output_dir}: {e}")
         return video_path, False
 
+    # Paths
     output_file = os.path.join(output_dir, "output.m3u8")
-    video_codec, audio_codec = get_codecs(video_path)
+    seg_pattern = os.path.join(output_dir, "output%0d.ts")
+
+    # (Optional) thumbnail for your UI
     generate_thumbnail(video_path, output_dir)
 
-    v = (video_codec or "").lower()
-    a = (audio_codec or "").lower()
-    use_remux = v.startswith("h264") and a == "aac"
+    cmd = [
+        FFMPEG_BIN,
+        "-i", video_path,
+        # Video
+        "-c:v", encoder,
+        "-profile:v", "high",
+        "-level", "4.0",
+        "-pix_fmt", "yuv420p",
+    ]
 
-    if use_remux:
-        cmd = [
-            FFMPEG_BIN,
-            "-y",
-            "-i", video_path,
-            "-c", "copy",
-            "-start_number", "0",
-            "-hls_time", "10",
-            "-hls_list_size", "0",
-            "-f", "hls",
-            output_file,
-            "-progress", "pipe:1",
-            "-nostats"
-        ]
+    # ---- Rate control + preset per encoder ----
+
+    if encoder == "h264_videotoolbox":
+        # Apple GPU: -q:v (lower = better). Map CRF≈q:v.
+        # CRF 16→~62, 18→~68, 20→~74, 23→~83, clamp to [55..95]
+        qv = max(1, min(100,66 - 2 * (int(crf_value) - 16)))
+        cmd += ["-q:v", str(qv)]
+
+    elif encoder == "h264_nvenc":
+        # NVIDIA: CQ + preset p5 ~ "fast"
+        cq = max(0, min(51, int(crf_value) + 2))  # CRF16→CQ18 (range 0..51)
+        cmd += ["-rc:v","vbr_hq","-cq",str(cq),"-b:v","0","-maxrate","0","-bufsize","0","-preset","p5"]
+
+    elif encoder == "h264_qsv":
+        # Intel Quick Sync: ICQ (CRF-like) uses -rc icq + -global_quality
+        # Map CRF 16..28 to ICQ ~18..30 (shift +2 like NVENC)
+        icq = max(1, min(51, int(crf_value) + 2))
+        cmd += ["-preset", "fast", "-rc:v", "icq", "-global_quality", str(icq)]
+
+    elif encoder == "h264_amf":
+        # AMD AMF: CQP (constant QP). Use one QP for all frames or bias B-frames slightly.
+        # Map CRF 16..28 to QP ~18..30 (shift +2 like NVENC)
+        qp = max(0, min(51, int(crf_value) + 2))
+        cmd += ["-quality", "balanced", "-rc", "cqp", "-qp_i", str(qp), "-qp_p", str(qp), "-qp_b", str(qp)]
+
     else:
-        cmd = [
-            FFMPEG_BIN,
-            "-y",
-            "-i", video_path,
-            "-c:v", encoder,
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ac", "2",
-            "-start_number", "0",
-            "-hls_time", "10",
-            "-hls_list_size", "0",
-            "-f", "hls",
-            output_file,
-            "-progress", "pipe:1",
-            "-nostats"
-        ]
-        # Add optional parameters only if using CPU
-        if encoder == "libx264":
-            cmd.insert(cmd.index("-c:v") + 2, "-preset")
-            cmd.insert(cmd.index("-preset") + 1, "fast")
-            cmd.insert(cmd.index("-preset") + 2, "-crf")
-            cmd.insert(cmd.index("-crf") + 1, str(int(crf_value)))
-        else:
-            cmd.insert(cmd.index("-c:v") + 2, "-b:v")
-            cmd.insert(cmd.index("-b:v") + 1, "5000k")
+        # Fallback (treat like CPU x264)
+        cmd += ["-preset", "fast", "-crf", str(int(crf_value))]
 
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+    # ---- GOP / scene cut ----
+    cmd += [
+        "-threads", "0",
+        "-g", "240",
+        "-keyint_min", "240",
+        "-sc_threshold", "0",
+        # Audio
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ac", "2",
+        "-ar", "48000",
+        # HLS
+        "-f", "hls",
+        "-hls_time", "10",
+        "-hls_playlist_type", "vod",
+        "-hls_segment_type", "mpegts",
+        "-hls_flags", "independent_segments",
+        "-hls_segment_filename", seg_pattern,
+        output_file,
+        # Progress
+        "-progress", "pipe:1",
+        "-nostats",
+    ]
+
+
+    # ---- spawn process in its own group/session for clean kill ----
+    creationflags = 0
+    preexec_fn = None
+    if sys.platform.startswith("win"):
+        # New process group on Windows
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        # New session on POSIX so we can os.killpg()
+        import os as _os
+        preexec_fn = _os.setsid
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                               bufsize=1, creationflags=creationflags, preexec_fn=preexec_fn)
+
+    # Register
+    RUNNING_PROCS.add(process)
     last_reported = 0
 
     for line in process.stdout:
+        if SHUTTING_DOWN:
+            break
         if "out_time_ms=" in line:
             value = line.strip().split("=")[1]
-            if not value.isdigit():  # Skip 'N/A' or invalid values
+            if not value.isdigit():
                 continue
             processed_seconds = int(value) / 1_000_000
             increment = max(0, processed_seconds - last_reported)
@@ -275,13 +358,14 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
                 remaining = (total_duration_sum - processed_duration_total[0]) / speed if speed > 0 else 0
                 mins, secs = divmod(max(0, int(remaining)), 60)
 
-                # Update UI from main thread
                 ui_async(progress_bar.configure, value=overall_percent)
                 ui_async(progress_label.config, text=f"{overall_percent:.1f}%")
                 ui_async(total_time_label.config, text=f"Total Estimated Time Left: {mins:02d}:{secs:02d}")
 
     process.wait()
+    RUNNING_PROCS.discard(process)
     return video_path, process.returncode == 0
+
 
 
 def convert_all_videos_parallel(custom_output_dir, crf_value):
@@ -479,13 +563,82 @@ class ScrollableFrame(tk.Frame):
     def content(self):
         return self.inner
 
+def _kill_process_tree(p: subprocess.Popen):
+    try:
+        if p.poll() is not None:
+            return  # already exited
+        if sys.platform.startswith("win"):
+            # Try gentle terminate, then kill
+            try:
+                p.terminate()
+                p.wait(timeout=1.0)
+            except Exception:
+                pass
+            try:
+                p.kill()
+            except Exception:
+                pass
+        else:
+            # POSIX: kill the whole group/session
+            try:
+                import os as _os
+                _os.killpg(p.pid, signal.SIGTERM)
+            except Exception:
+                pass
+            # last resort
+            try:
+                p.terminate()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def on_close():
+    # Prevent threads from posting UI / messageboxes
+    global SHUTTING_DOWN
+    SHUTTING_DOWN = True
+
+    # Disable all controls to avoid new work
+    try:
+        disable_controls()
+    except Exception:
+        pass
+
+    # Kill any running ffmpeg processes
+    procs = list(RUNNING_PROCS)
+    for p in procs:
+        _kill_process_tree(p)
+
+    # Give them a brief moment to exit cleanly
+    t0 = time.time()
+    for p in procs:
+        try:
+            p.wait(timeout=max(0.0, 1.0 - (time.time() - t0)))
+        except Exception:
+            pass
+
+    # Tear down the UI and exit
+    try:
+        root.quit()
+    except Exception:
+        pass
+    try:
+        root.destroy()
+    except Exception:
+        pass
+
+    # As a final guard (threads may still be alive), force-exit the interpreter
+    os._exit(0)
+
+
 
 # -----------------------------
 # GUI Setup
 # -----------------------------
 root = TkinterDnD.Tk()
+root.protocol("WM_DELETE_WINDOW", on_close)
 root.title("Video to HLS Converter")
-root.geometry("650x800")
+root.geometry("600x760")
 root.resizable(True, True)
 
 # Bind the UI async dispatcher now that root exists
@@ -496,9 +649,6 @@ verify_binaries()
 
 frame = tk.Frame(root)
 frame.pack(expand=True, fill="both", pady=10)
-
-label = tk.Label(frame, text="Drag and Drop Video Files Here", pady=10)
-label.pack(pady=5)
 
 drop_area = tk.Label(frame, text="📂 Drop Files Here", relief="solid", width=60, height=6)
 drop_area.pack(pady=10)
