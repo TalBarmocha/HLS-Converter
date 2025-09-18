@@ -70,7 +70,7 @@ ui_async = None
 def generate_thumbnail(input_path, output_dir):
     """Generate a thumbnail image from the video at 25% of its duration."""
     try:
-        duration = get_video_duration(input_path)
+        duration, _ = get_video_duration(input_path)
         if duration <= 0:
             return  # skip silently
         quarter_time = duration * 0.25
@@ -204,18 +204,80 @@ def get_codecs(video_path):
 
 
 def get_video_duration(video_path):
-    """Get the duration of the video file in seconds (float). Returns 0 on failure."""
+    """
+    Return (duration_seconds: float, reason: str|None).
+    Tries multiple ffprobe methods; if all fail, returns 0 and a short reason.
+    """
+    import json
+
+    # 1) format.duration
     try:
-        result = subprocess.run(
+        p = subprocess.run(
             [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
         )
-        return float((result.stdout or "0").strip())
-    except Exception:
-        return 0
+        s = (p.stdout or "").strip()
+        if s:
+            try:
+                return float(s), None
+            except Exception:
+                pass
+        err1 = (p.stderr or "").strip()
+    except Exception as e:
+        err1 = f"{e}"
+
+    # 2) stream:0 duration (some MP4s don’t expose container duration cleanly)
+    try:
+        p = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of", "default=nw=1:nk=1", video_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+        )
+        s = (p.stdout or "").strip()
+        if s and s.lower() != "n/a":
+            try:
+                return float(s), None
+            except Exception:
+                pass
+        err2 = (p.stderr or "").strip()
+    except Exception as e:
+        err2 = f"{e}"
+
+    # 3) JSON fallback: take the max of any durations we find
+    try:
+        p = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-print_format", "json",
+             "-show_format", "-show_streams", video_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+        )
+        data = json.loads(p.stdout or "{}")
+        cands = []
+        try:
+            d = data.get("format", {}).get("duration")
+            if d and str(d).lower() != "n/a":
+                cands.append(float(d))
+        except Exception:
+            pass
+        for st in data.get("streams", []):
+            d = st.get("duration")
+            if d and str(d).lower() != "n/a":
+                try:
+                    cands.append(float(d))
+                except Exception:
+                    pass
+        if cands:
+            return max(cands), None
+        err3 = (p.stderr or "").strip()
+    except Exception as e:
+        err3 = f"{e}"
+
+    # If all failed, report a compact reason
+    reason = "\n".join(x for x in [err1, err2, err3] if x).strip() or "ffprobe did not return a duration"
+    # Keep only the last few lines to avoid giant popups
+    tail = "\n".join(reason.splitlines()[-10:])
+    return 0.0, tail
+
 
 
 # -----------------------------
@@ -236,9 +298,9 @@ encoder = detect_gpu_encoder()
 
 def convert_single_video(video_path, custom_output_dir, crf_value, total_duration_sum, start_time):
     """Convert a single video to HLS with YOUR exact FFmpeg settings and live progress."""
-    duration = get_video_duration(video_path)
+    duration, dur_reason = get_video_duration(video_path)
     if duration <= 0:
-        return video_path, False
+        return video_path, False, f"Invalid or zero duration (ffprobe failed or unsupported file)\n{dur_reason}"
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     base_output_dir = custom_output_dir.strip() if custom_output_dir.strip() else os.path.dirname(video_path)
@@ -247,67 +309,42 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
     try:
         os.makedirs(output_dir, exist_ok=True)
     except Exception as e:
-        print(f"Failed to create output dir {output_dir}: {e}")
-        return video_path, False
+        return video_path, False, f"Failed to create output dir {output_dir}: {e}"
 
     # Paths
     output_file = os.path.join(output_dir, "output.m3u8")
     seg_pattern = os.path.join(output_dir, "output%0d.ts")
 
-    # (Optional) thumbnail for your UI
-    generate_thumbnail(video_path, output_dir)
+    # Thumbnail is optional; don't fail conversion if it breaks
+    try:
+        generate_thumbnail(video_path, output_dir)
+    except Exception as e:
+        print(f"Thumbnail generation failed for {video_path}: {e}")
 
+    # Build FFmpeg command (unchanged from your code up to HLS flags)
     cmd = [
-        FFMPEG_BIN,
-        "-i", video_path,
-        # Video
-        "-c:v", encoder,
-        "-profile:v", "high",
-        "-level", "4.0",
-        "-pix_fmt", "yuv420p",
+        FFMPEG_BIN, "-i", video_path,
+        "-c:v", encoder, "-profile:v", "high", "-level", "4.0", "-pix_fmt", "yuv420p",
     ]
-
-    # ---- Rate control + preset per encoder ----
-
     if encoder == "h264_videotoolbox":
-        # Apple GPU: -q:v (lower = better). Map CRF≈q:v.
-        # CRF 16→~62, 18→~68, 20→~74, 23→~83, clamp to [55..95]
-        qv = max(1, min(100,66 - 2 * (int(crf_value) - 16)))
+        qv = max(1, min(100, 66 - 2 * (int(crf_value) - 16)))
         cmd += ["-q:v", str(qv)]
-
     elif encoder == "h264_nvenc":
-        # NVIDIA: CQ + preset p5 ~ "fast"
-        cq = max(0, min(51, int(crf_value) + 2))  # CRF16→CQ18 (range 0..51)
-        cmd += ["-rc:v","vbr_hq","-cq",str(cq),"-b:v","0","-maxrate","0","-bufsize","0","-preset","p5"]
-
+        cq = max(0, min(51, int(crf_value) + 2))
+        cmd += ["-rc:v", "vbr_hq", "-cq", str(cq), "-b:v", "0", "-maxrate", "0", "-bufsize", "0", "-preset", "p5"]
     elif encoder == "h264_qsv":
-        # Intel Quick Sync: ICQ (CRF-like) uses -rc icq + -global_quality
-        # Map CRF 16..28 to ICQ ~18..30 (shift +2 like NVENC)
         icq = max(1, min(51, int(crf_value) + 2))
         cmd += ["-preset", "fast", "-rc:v", "icq", "-global_quality", str(icq)]
-
     elif encoder == "h264_amf":
-        # AMD AMF: CQP (constant QP). Use one QP for all frames or bias B-frames slightly.
-        # Map CRF 16..28 to QP ~18..30 (shift +2 like NVENC)
         qp = max(0, min(51, int(crf_value) + 2))
         cmd += ["-quality", "balanced", "-rc", "cqp", "-qp_i", str(qp), "-qp_p", str(qp), "-qp_b", str(qp)]
-
     else:
-        # Fallback (treat like CPU x264)
         cmd += ["-preset", "fast", "-crf", str(int(crf_value))]
 
-    # ---- GOP / scene cut ----
     cmd += [
         "-threads", "0",
-        "-g", "240",
-        "-keyint_min", "240",
-        "-sc_threshold", "0",
-        # Audio
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ac", "2",
-        "-ar", "48000",
-        # HLS
+        "-g", "240", "-keyint_min", "240", "-sc_threshold", "0",
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
         "-f", "hls",
         "-hls_time", "10",
         "-hls_playlist_type", "vod",
@@ -315,63 +352,86 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
         "-hls_flags", "independent_segments",
         "-hls_segment_filename", seg_pattern,
         output_file,
-        # Progress
         "-progress", "pipe:1",
         "-nostats",
     ]
 
+    # --- spawn ---
+    try:
+        creationflags = 0
+        preexec_fn = None
+        if sys.platform.startswith("win"):
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            import os as _os
+            preexec_fn = _os.setsid
 
-    # ---- spawn process in its own group/session for clean kill ----
-    creationflags = 0
-    preexec_fn = None
-    if sys.platform.startswith("win"):
-        # New process group on Windows
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        # New session on POSIX so we can os.killpg()
-        import os as _os
-        preexec_fn = _os.setsid
+        # IMPORTANT: keep stderr separate so we can show real errors
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,          # <— changed from STDERR=STDOUT
+            universal_newlines=True,
+            bufsize=1,
+            creationflags=creationflags,
+            preexec_fn=preexec_fn
+        )
 
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
-                               bufsize=1, creationflags=creationflags, preexec_fn=preexec_fn)
+        RUNNING_PROCS.add(process)
+        last_reported = 0
 
-    # Register
-    RUNNING_PROCS.add(process)
-    last_reported = 0
+        for line in process.stdout:
+            if SHUTTING_DOWN:
+                break
+            if "out_time_ms=" in line:
+                value = line.strip().split("=")[1]
+                if not value.isdigit():
+                    continue
+                processed_seconds = int(value) / 1_000_000
+                increment = max(0, processed_seconds - last_reported)
+                last_reported = processed_seconds
 
-    for line in process.stdout:
-        if SHUTTING_DOWN:
-            break
-        if "out_time_ms=" in line:
-            value = line.strip().split("=")[1]
-            if not value.isdigit():
-                continue
-            processed_seconds = int(value) / 1_000_000
-            increment = max(0, processed_seconds - last_reported)
-            last_reported = processed_seconds
+                with lock:
+                    processed_duration_total[0] = min(total_duration_sum, processed_duration_total[0] + increment)
+                    overall_percent = (processed_duration_total[0] / total_duration_sum) * 100 if total_duration_sum else 0
+                    elapsed = time.time() - start_time
+                    speed = processed_duration_total[0] / elapsed if elapsed > 0 else 0
+                    remaining = (total_duration_sum - processed_duration_total[0]) / speed if speed > 0 else 0
+                    mins, secs = divmod(max(0, int(remaining)), 60)
 
-            with lock:
-                processed_duration_total[0] = min(total_duration_sum, processed_duration_total[0] + increment)
-                overall_percent = (processed_duration_total[0] / total_duration_sum) * 100 if total_duration_sum else 0
-                elapsed = time.time() - start_time
-                speed = processed_duration_total[0] / elapsed if elapsed > 0 else 0
-                remaining = (total_duration_sum - processed_duration_total[0]) / speed if speed > 0 else 0
-                mins, secs = divmod(max(0, int(remaining)), 60)
+                    ui_async(progress_bar.configure, value=overall_percent)
+                    ui_async(progress_label.config, text=f"{overall_percent:.1f}%")
+                    ui_async(total_time_label.config, text=f"Total Estimated Time Left: {mins:02d}:{secs:02d}")
 
-                ui_async(progress_bar.configure, value=overall_percent)
-                ui_async(progress_label.config, text=f"{overall_percent:.1f}%")
-                ui_async(total_time_label.config, text=f"Total Estimated Time Left: {mins:02d}:{secs:02d}")
+        # Finish and collect stderr
+        process.wait()
+        RUNNING_PROCS.discard(process)
 
-    process.wait()
-    RUNNING_PROCS.discard(process)
-    return video_path, process.returncode == 0
+        stderr_output = ""
+        if process.stderr:
+            try:
+                stderr_output = process.stderr.read()
+            except Exception:
+                pass
 
+        if process.returncode != 0:
+            # Keep the last ~25 lines to avoid huge popups
+            lines = (stderr_output or "").strip().splitlines()
+            tail = "\n".join(lines[-25:]) if lines else "Unknown ffmpeg error"
+            return video_path, False, f"ffmpeg failed (exit {process.returncode})\n{tail}"
+
+        return video_path, True, None
+
+    except Exception as e:
+        return video_path, False, f"Worker crashed: {e}"
 
 
 def convert_all_videos_parallel(custom_output_dir, crf_value):
-    """Convert all selected videos in parallel with progress updates."""
     try:
-        total_duration = sum(get_video_duration(v) for v in selected_videos)
+        total_duration = 0
+        for v in selected_videos:
+            d, _ = get_video_duration(v)  # unpack (duration, reason)
+            total_duration += max(0, d)
         processed_duration_total[0] = 0
         start_time = time.time()
 
@@ -380,14 +440,19 @@ def convert_all_videos_parallel(custom_output_dir, crf_value):
                        for v in selected_videos]
 
             for future in futures:
-                video_path, success = future.result()
+                try:
+                    video_path, success, error_msg = future.result()
+                except Exception as e:
+                    # Defensive: if a worker raised, show that error
+                    ui_async(messagebox.showerror, "Error", f"Conversion worker failed:\n{e}")
+                    continue
+
                 if not success:
-                    ui_async(messagebox.showerror, "Error", f"Failed: {os.path.basename(video_path)}")
+                    ui_async(messagebox.showerror, "Error",
+                             f"Failed: {os.path.basename(video_path)}\n\n{error_msg or 'Unknown error'}")
 
         ui_async(messagebox.showinfo, "Done", "All conversions completed!")
-
     finally:
-        # Reset UI from main thread
         ui_async(enable_controls)
         ui_async(clear_all_files)
         ui_async(progress_bar.configure, value=0)
