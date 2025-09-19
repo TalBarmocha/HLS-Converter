@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor
 from tkinterdnd2 import TkinterDnD, DND_FILES
+from collections import deque
 
 # Track all running ffmpeg processes so we can stop them on close
 RUNNING_PROCS = set()
@@ -366,11 +367,14 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
             import os as _os
             preexec_fn = _os.setsid
 
-        # IMPORTANT: keep stderr separate so we can show real errors
+        # Windows: merge stderr→stdout to avoid deadlocks on full stderr pipe.
+        # macOS/Linux: keep stderr separate (unchanged behavior).
+        merge_stderr = subprocess.STDOUT if sys.platform.startswith("win") else subprocess.PIPE
+
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,          # <— changed from STDERR=STDOUT
+            stderr=merge_stderr,
             universal_newlines=True,
             bufsize=1,
             creationflags=creationflags,
@@ -379,51 +383,71 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
 
         RUNNING_PROCS.add(process)
         last_reported = 0
+        last_progress_ts = time.time()
+        tail = deque(maxlen=200)  # keep recent lines for clear error popups
 
-        for line in process.stdout:
+        # Read progress (and, on Windows, merged stderr) line-by-line
+        for line in iter(process.stdout.readline, ""):
             if SHUTTING_DOWN:
                 break
-            if "out_time_ms=" in line:
-                value = line.strip().split("=")[1]
-                if not value.isdigit():
-                    continue
-                processed_seconds = int(value) / 1_000_000
-                increment = max(0, processed_seconds - last_reported)
-                last_reported = processed_seconds
+            s = line.strip()
+            if not s:
+                continue
 
-                with lock:
-                    processed_duration_total[0] = min(total_duration_sum, processed_duration_total[0] + increment)
-                    overall_percent = (processed_duration_total[0] / total_duration_sum) * 100 if total_duration_sum else 0
-                    elapsed = time.time() - start_time
-                    speed = processed_duration_total[0] / elapsed if elapsed > 0 else 0
-                    remaining = (total_duration_sum - processed_duration_total[0]) / speed if speed > 0 else 0
-                    mins, secs = divmod(max(0, int(remaining)), 60)
+            # Keep a short tail for diagnostics if something fails
+            tail.append(s)
 
-                    ui_async(progress_bar.configure, value=overall_percent)
-                    ui_async(progress_label.config, text=f"{overall_percent:.1f}%")
-                    ui_async(total_time_label.config, text=f"Total Estimated Time Left: {mins:02d}:{secs:02d}")
+            # Parse progress from -progress pipe:1
+            if s.startswith("out_time_ms="):
+                value = s.split("=", 1)[1]
+                if value.isdigit():
+                    processed_seconds = int(value) / 1_000_000
+                    increment = max(0, processed_seconds - last_reported)
+                    last_reported = processed_seconds
+                    last_progress_ts = time.time()
 
-        # Finish and collect stderr
+                    with lock:
+                        processed_duration_total[0] = min(total_duration_sum, processed_duration_total[0] + increment)
+                        overall_percent = (processed_duration_total[0] / total_duration_sum) * 100 if total_duration_sum else 0
+                        elapsed = time.time() - start_time
+                        speed = processed_duration_total[0] / elapsed if elapsed > 0 else 0
+                        remaining = (total_duration_sum - processed_duration_total[0]) / speed if speed > 0 else 0
+                        mins, secs = divmod(max(0, int(remaining)), 60)
+
+                        ui_async(progress_bar.configure, value=overall_percent)
+                        ui_async(progress_label.config, text=f"{overall_percent:.1f}%")
+                        ui_async(total_time_label.config, text=f"Total Estimated Time Left: {mins:02d}:{secs:02d}")
+
+            # Optional safety: kill if no progress for a long time (uncomment if desired)
+            # if time.time() - last_progress_ts > 120:  # 2 minutes without out_time_ms
+            #     _kill_process_tree(process)
+            #     RUNNING_PROCS.discard(process)
+            #     return video_path, False, "No progress for 120s; ffmpeg likely stalled."
+
         process.wait()
         RUNNING_PROCS.discard(process)
 
+        # Collect stderr ONLY when it wasn't merged (macOS/Linux path).
         stderr_output = ""
-        if process.stderr:
+        if not sys.platform.startswith("win") and process.stderr:
             try:
                 stderr_output = process.stderr.read()
             except Exception:
                 pass
 
         if process.returncode != 0:
-            # Keep the last ~25 lines to avoid huge popups
-            lines = (stderr_output or "").strip().splitlines()
-            tail = "\n".join(lines[-25:]) if lines else "Unknown ffmpeg error"
-            return video_path, False, f"ffmpeg failed (exit {process.returncode})\n{tail}"
+            # Prefer the captured tail (works on Windows); fall back to stderr_output (mac/Linux)
+            lines = list(tail)
+            if not lines and stderr_output:
+                lines = stderr_output.strip().splitlines()
+            tail_text = "\n".join(lines[-25:]) if lines else "Unknown ffmpeg error"
+            return video_path, False, f"ffmpeg failed (exit {process.returncode})\n{tail_text}"
 
         return video_path, True, None
 
     except Exception as e:
         return video_path, False, f"Worker crashed: {e}"
+
 
 
 def convert_all_videos_parallel(custom_output_dir, crf_value):
