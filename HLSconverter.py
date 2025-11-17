@@ -1,14 +1,17 @@
-import sys
-import os
-import subprocess
-import threading
-import time
-import signal
+import sys, os, subprocess, threading, time, signal
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from collections import deque
+
+# -----------------------------
+# Windows taskbar icon fix
+# -----------------------------
+if sys.platform == "win32":
+    import ctypes
+    myappid = "hls.Converter.App"  # any unique string
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
 # Track all running ffmpeg processes so we can stop them on close
 RUNNING_PROCS = set()
@@ -24,6 +27,19 @@ if sys.platform.startswith("win"):
 else:
     FFMPEG_BIN = os.path.join(BASE_DIR, "bin", "ffmpeg")
     FFPROBE_BIN = os.path.join(BASE_DIR, "bin", "ffprobe")
+
+# -----------------------------
+# Resource path helper
+# -----------------------------
+def resource_path(relative_path: str) -> str:
+    """
+    Get absolute path to resource, works for dev and PyInstaller.
+    """
+    if hasattr(sys, "_MEIPASS"):  # PyInstaller bundle
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 # -----------------------------
 # Helpers & preflight checks
@@ -160,21 +176,23 @@ def detect_gpu_encoder():
 
 
 
-def gpu_type_to_string():
-    """Convert GPU encoder type to a human-readable string."""
-    gpu = detect_gpu_encoder()
-    if gpu == "h264_videotoolbox":
-        return "Apple VideoToolbox"
-    elif gpu == "h264_nvenc":
-        return "NVIDIA NVENC"
-    elif gpu == "h264_qsv":
-        return "Intel Quick Sync"
-    elif gpu == "h264_amf":
-        return "AMD AMF"
-    elif gpu == "libx264":
-        return "Software (libx264)"
+def gpu_type_to_string(current_encoder=None):
+    """Convert encoder type to a human-readable string."""
+    if current_encoder is None:
+        current_encoder = detect_gpu_encoder()
+
+    if current_encoder == "h264_videotoolbox":
+        return "Apple VideoToolbox (GPU)"
+    elif current_encoder == "h264_nvenc":
+        return "NVIDIA NVENC (GPU)"
+    elif current_encoder == "h264_qsv":
+        return "Intel Quick Sync (GPU)"
+    elif current_encoder == "h264_amf":
+        return "AMD AMF (GPU)"
+    elif current_encoder == "libx264":
+        return "Software (libx264, CPU)"
     else:
-        return "Unknown GPU Encoder"
+        return f"{current_encoder} (Unknown Encoder)"
 
 
 def get_codecs(video_path):
@@ -297,7 +315,7 @@ encoder = detect_gpu_encoder()
 # Conversion workers (run in threads)
 # -----------------------------
 
-def convert_single_video(video_path, custom_output_dir, crf_value, total_duration_sum, start_time):
+def convert_single_video(video_path, custom_output_dir, crf_value, total_duration_sum, start_time, encoder_name):
     """Convert a single video to HLS with YOUR exact FFmpeg settings and live progress."""
     duration, dur_reason = get_video_duration(video_path)
     if duration <= 0:
@@ -325,22 +343,23 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
     # Build FFmpeg command (unchanged from your code up to HLS flags)
     cmd = [
         FFMPEG_BIN, "-i", video_path,
-        "-c:v", encoder, "-profile:v", "high", "-level", "4.0", "-pix_fmt", "yuv420p",
+        "-c:v", encoder_name, "-profile:v", "high", "-level", "4.0", "-pix_fmt", "yuv420p",
     ]
-    if encoder == "h264_videotoolbox":
+    if encoder_name == "h264_videotoolbox":
         qv = max(1, min(100, 66 - 2 * (int(crf_value) - 16)))
         cmd += ["-q:v", str(qv)]
-    elif encoder == "h264_nvenc":
+    elif encoder_name == "h264_nvenc":
         cq = max(0, min(51, int(crf_value) + 2))
         cmd += ["-rc:v", "vbr_hq", "-cq", str(cq), "-b:v", "0", "-maxrate", "0", "-bufsize", "0", "-preset", "p5"]
-    elif encoder == "h264_qsv":
+    elif encoder_name == "h264_qsv":
         icq = max(1, min(51, int(crf_value) + 2))
         cmd += ["-preset", "fast", "-rc:v", "icq", "-global_quality", str(icq)]
-    elif encoder == "h264_amf":
+    elif encoder_name == "h264_amf":
         qp = max(0, min(51, int(crf_value) + 2))
         cmd += ["-quality", "balanced", "-rc", "cqp", "-qp_i", str(qp), "-qp_p", str(qp), "-qp_b", str(qp)]
     else:
         cmd += ["-preset", "fast", "-crf", str(int(crf_value))]
+
 
     cmd += [
         "-threads", "0",
@@ -459,9 +478,22 @@ def convert_all_videos_parallel(custom_output_dir, crf_value):
         processed_duration_total[0] = 0
         start_time = time.time()
 
+        # Freeze the encoder choice at start (respecting CPU/GPU toggle)
+        current_encoder = encoder
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(convert_single_video, v, custom_output_dir, crf_value, total_duration, start_time)
-                       for v in selected_videos]
+            futures = [
+                executor.submit(
+                    convert_single_video,
+                    v,
+                    custom_output_dir,
+                    crf_value,
+                    total_duration,
+                    start_time,
+                    current_encoder
+                )
+                for v in selected_videos
+            ]
 
             for future in futures:
                 try:
@@ -725,9 +757,19 @@ def on_close():
 # GUI Setup
 # -----------------------------
 root = TkinterDnD.Tk()
+icon_path = resource_path("icon.ico")
+if sys.platform == "win32":
+    # Small icon (title bar)
+    try:
+        root.iconbitmap(default=icon_path)
+    except Exception:
+        pass
+elif sys.platform == "darwin":
+    # Don't call iconbitmap on macOS; let the app bundle icon handle it
+    pass
 root.protocol("WM_DELETE_WINDOW", on_close)
 root.title("Video to HLS Converter")
-root.geometry("600x760")
+root.geometry("600x800")
 root.resizable(True, True)
 
 # Bind the UI async dispatcher now that root exists
@@ -778,8 +820,32 @@ quality_slider.pack(pady=5)
 quality_hint = tk.Label(frame, text="Lower CRF = Better Quality (16=Best, 28=Low)", fg="gray")
 quality_hint.pack(pady=2)
 
-gpu_type_label = tk.Label(frame, text="GPU Encoder Detected: " + gpu_type_to_string())
+# CPU/GPU toggle
+def on_force_cpu_toggled():
+    global encoder
+    if force_cpu_var.get():
+        # Force CPU encoder
+        encoder = "libx264"
+    else:
+        # Re-detect best GPU encoder (may still be libx264 if no GPU)
+        encoder = detect_gpu_encoder()
+
+    # Update label to reflect current encoder choice
+    gpu_type_label.config(text="Encoder: " + gpu_type_to_string(encoder))
+
+force_cpu_var = tk.BooleanVar(value=False)
+
+gpu_type_label = tk.Label(frame, text="Encoder: " + gpu_type_to_string(encoder))
 gpu_type_label.pack(pady=5)
+
+force_cpu_check = tk.Checkbutton(
+    frame,
+    text="Force CPU (libx264)",
+    variable=force_cpu_var,
+    command=on_force_cpu_toggled
+)
+force_cpu_check.pack(pady=5)
+
 
 convert_btn = tk.Button(frame, text="CONVERT ALL", command=start_conversion, width=20, height=2)
 convert_btn.pack(pady=10)
