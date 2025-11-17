@@ -89,7 +89,7 @@ If you prefer to build the application manually:
      ```
    - **Windows:**
      ```bash
-     pyinstaller --onefile --windowed --icon=icon.ico --add-binary "bin/ffmpeg.exe;bin" --add-binary "bin/ffprobe.exe;bin" --hidden-import=tkinterdnd2 HLSconverter.py
+     pyinstaller --onefile --windowed --noconsole --icon=icon.ico --add-binary "bin/ffmpeg.exe;bin" --add-binary "bin/ffprobe.exe;bin" --hidden-import=tkinterdnd2 --add-data "icon.ico;." HLSconverter.py
      ```
      
 
