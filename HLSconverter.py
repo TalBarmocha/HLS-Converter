@@ -342,7 +342,7 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
 
     # Build FFmpeg command (unchanged from your code up to HLS flags)
     cmd = [
-        FFMPEG_BIN, "-i", video_path,
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-i", video_path,"-map_metadata", "-1",
         "-c:v", encoder_name, "-profile:v", "high", "-level", "4.0", "-pix_fmt", "yuv420p",
     ]
     if encoder_name == "h264_videotoolbox":
@@ -394,7 +394,9 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
             cmd,
             stdout=subprocess.PIPE,
             stderr=merge_stderr,
-            universal_newlines=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             creationflags=creationflags,
             preexec_fn=preexec_fn
