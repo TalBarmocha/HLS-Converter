@@ -229,6 +229,8 @@ def get_video_duration(video_path):
     """
     import json
 
+    err1 = err2 = err3 = ""
+
     # 1) format.duration
     try:
         p = subprocess.run(
@@ -246,7 +248,7 @@ def get_video_duration(video_path):
     except Exception as e:
         err1 = f"{e}"
 
-    # 2) stream:0 duration (some MP4s don’t expose container duration cleanly)
+    # 2) stream:0 duration (some MP4s don't expose container duration cleanly)
     try:
         p = subprocess.run(
             [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
@@ -340,9 +342,9 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
     except Exception as e:
         print(f"Thumbnail generation failed for {video_path}: {e}")
 
-    # Build FFmpeg command (unchanged from your code up to HLS flags)
+    # Build FFmpeg command
     cmd = [
-        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-i", video_path,"-map_metadata", "-1",
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-i", video_path, "-map_metadata", "-1",
         "-c:v", encoder_name, "-profile:v", "high", "-level", "4.0", "-pix_fmt", "yuv420p",
     ]
     if encoder_name == "h264_videotoolbox":
@@ -360,7 +362,6 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
     else:
         cmd += ["-preset", "fast", "-crf", str(int(crf_value))]
 
-
     cmd += [
         "-threads", "0",
         "-g", "240", "-keyint_min", "240", "-sc_threshold", "0",
@@ -371,9 +372,10 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
         "-hls_segment_type", "mpegts",
         "-hls_flags", "independent_segments",
         "-hls_segment_filename", seg_pattern,
-        output_file,
+        # FIX: -progress and -nostats must come BEFORE the output filename
         "-progress", "pipe:1",
         "-nostats",
+        output_file,
     ]
 
     # --- spawn ---
@@ -386,14 +388,10 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
             import os as _os
             preexec_fn = _os.setsid
 
-        # Windows: merge stderr→stdout to avoid deadlocks on full stderr pipe.
-        # macOS/Linux: keep stderr separate (unchanged behavior).
-        merge_stderr = subprocess.STDOUT if sys.platform.startswith("win") else subprocess.PIPE
-
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=merge_stderr,
+            stderr=subprocess.PIPE,   # FIX: always keep stderr as a separate pipe
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -403,11 +401,26 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
         )
 
         RUNNING_PROCS.add(process)
+
+        # FIX: drain stderr in a background thread so it never fills the OS pipe
+        # buffer and deadlocks ffmpeg mid-conversion on large files.
+        stderr_lines = []
+
+        def _drain_stderr(pipe):
+            try:
+                for ln in iter(pipe.readline, ""):
+                    stderr_lines.append(ln.rstrip())
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(process.stderr,), daemon=True)
+        stderr_thread.start()
+
         last_reported = 0
         last_progress_ts = time.time()
         tail = deque(maxlen=200)  # keep recent lines for clear error popups
 
-        # Read progress (and, on Windows, merged stderr) line-by-line
+        # Read progress from -progress pipe:1 line-by-line
         for line in iter(process.stdout.readline, ""):
             if SHUTTING_DOWN:
                 break
@@ -446,18 +459,13 @@ def convert_single_video(video_path, custom_output_dir, crf_value, total_duratio
             #     return video_path, False, "No progress for 120s; ffmpeg likely stalled."
 
         process.wait()
+        stderr_thread.join(timeout=5)  # Wait for stderr drain to finish
         RUNNING_PROCS.discard(process)
 
-        # Collect stderr ONLY when it wasn't merged (macOS/Linux path).
-        stderr_output = ""
-        if not sys.platform.startswith("win") and process.stderr:
-            try:
-                stderr_output = process.stderr.read()
-            except Exception:
-                pass
+        # Collect all stderr from the drain thread
+        stderr_output = "\n".join(stderr_lines)
 
         if process.returncode != 0:
-            # Prefer the captured tail (works on Windows); fall back to stderr_output (mac/Linux)
             lines = list(tail)
             if not lines and stderr_output:
                 lines = stderr_output.strip().splitlines()
